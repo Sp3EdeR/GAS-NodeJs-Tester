@@ -87,6 +87,7 @@ function createSpreadsheetService(log) {
   function createSheet(parent, name) {
     const cells = new Map();
     const formulas = new Map();
+    const numberFormats = new Map();
     let maxRows = 1000;
     let maxColumns = 26;
     const key = (row, column) => `${row}:${column}`;
@@ -96,6 +97,8 @@ function createSpreadsheetService(log) {
       getParent: () => parent,
       getIndex: () => parent.getSheets().indexOf(sheet) + 1,
       getLastRow: () => Math.max(0, ...Array.from(cells.keys(), cell => Number(cell.split(":")[0]))),
+      getLastColumn: () => Math.max(0,
+        ...Array.from(cells.keys(), cell => Number(cell.split(":")[1]))),
       getMaxRows: () => maxRows,
       getMaxColumns: () => maxColumns,
       setFrozenRows: () => sheet,
@@ -110,7 +113,7 @@ function createSpreadsheetService(log) {
         return sheet;
       },
       deleteRows(start, count) {
-        for (const store of [cells, formulas]) {
+        for (const store of [cells, formulas, numberFormats]) {
           const remaining = Array.from(store.entries());
           store.clear();
           for (const [cell, value] of remaining) {
@@ -133,12 +136,16 @@ function createSpreadsheetService(log) {
           setValues(values) {
             if (values.length !== rows || values.some(valuesRow => valuesRow.length !== columns))
               throw new Error("Range and value dimensions differ");
-            values.forEach((valuesRow, rowOffset) => valuesRow.forEach((value, columnOffset) => {
-              const cell = key(row + rowOffset, column + columnOffset);
-              formulas.delete(cell);
-              if (value === "") cells.delete(cell);
-              else cells.set(cell, value);
-            }));
+            for (let rowOffset = 0; rowOffset < values.length; rowOffset++) {
+              const valuesRow = values[rowOffset];
+              for (let columnOffset = 0; columnOffset < valuesRow.length; columnOffset++) {
+                const value = valuesRow[columnOffset];
+                const cell = key(row + rowOffset, column + columnOffset);
+                formulas.delete(cell);
+                if (value === "") cells.delete(cell);
+                else cells.set(cell, value);
+              }
+            }
             log("Spreadsheet.Range.setValues", {spreadsheet: parent.getId(), sheet: name,
               row, column, values});
             return range;
@@ -146,6 +153,13 @@ function createSpreadsheetService(log) {
           setValue: value => range.setValues([[value]]),
           setRichTextValues: values => range.setValues(values.map(valuesRow =>
             valuesRow.map(value => value.getText()))),
+          setNumberFormat(format) {
+            for (let rowOffset = 0; rowOffset < rows; rowOffset++) {
+              for (let columnOffset = 0; columnOffset < columns; columnOffset++)
+                numberFormats.set(key(row + rowOffset, column + columnOffset), String(format));
+            }
+            return range;
+          },
           getFormula: () => formulas.get(key(row, column)) || "",
           setFormula(formula) {
             range.setValue(formula);
@@ -175,6 +189,7 @@ function createSpreadsheetService(log) {
     return sheet;
   }
   const SpreadsheetApp = {
+    flush: () => log("SpreadsheetApp.flush (emulated)"),
     create(name) {
       const id = `local-sheet-${spreadsheets.size + 1}`;
       const sheets = [];
@@ -247,8 +262,15 @@ function applyLoadOrder(files, pairs) {
   return ordered;
 }
 
-function createContext(log = console.log, {src = "", trgt = ""} = {}) {
+/**
+ * Loads project GAS files into an isolated context with local Google services.
+ * @param {Function} log Operation logger.
+ * @param {object} options Source filters and optional EML directory.
+ * @returns {object} Context for executing and debugging GAS entry points.
+ */
+function createContext(log = console.log, {src = "", trgt = "", emlDir = ""} = {}) {
   let sequence = 0;
+  let locked = false;
   const calendars = [];
   const triggers = [];
   const scriptProperties = createProperties();
@@ -261,6 +283,24 @@ function createContext(log = console.log, {src = "", trgt = ""} = {}) {
   const context = vm.createContext({
     console: Object.fromEntries(["log", "info", "warn", "error", "debug"].map(level => [level, log])),
     Logger: {log},
+    get Gmail() {
+      const {createGmailDirectoryService} = require("./gmail.cjs");
+      const directory = path.resolve(emlDir || path.join(process.cwd(), "test-mails"));
+      const service = createGmailDirectoryService(log, directory, {allowMissing: !emlDir});
+      this.Gmail = service;
+      return service;
+    },
+    set Gmail(value) {
+      Object.defineProperty(this, "Gmail", {
+        value, writable: true, enumerable: true, configurable: true
+      });
+    },
+    LockService: {
+      getScriptLock: () => ({
+        tryLock() { if (locked) return false; locked = true; return true; },
+        releaseLock() { locked = false; }
+      })
+    },
     UrlFetchApp: {
       fetch(url, options) {
         log("UrlFetchApp.fetch %s %s", options?.method || "get", url);
@@ -311,6 +351,12 @@ function createContext(log = console.log, {src = "", trgt = ""} = {}) {
         byte => byte > 127 ? byte - 256 : byte
       ),
       formatDate,
+      base64DecodeWebSafe: value => Array.from(Buffer.from(value, "base64url"),
+        byte => byte > 127 ? byte - 256 : byte),
+      newBlob: bytes => ({
+        getDataAsString: (charset = "utf-8") => new TextDecoder(charset)
+          .decode(Buffer.from(bytes.map(byte => byte & 255)))
+      }),
       sleep(milliseconds) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds); }
     },
     ScriptApp: {
@@ -367,17 +413,25 @@ function createContext(log = console.log, {src = "", trgt = ""} = {}) {
     fs.readdirSync(projectDir).filter(name => name.endsWith(".gs") && name !== "Code.gs").sort(),
     loadOrder
   );
-  for (const name of [...files, "Code.gs"])
-    vm.runInContext(fs.readFileSync(path.join(projectDir, name), "utf8"), context, {filename: name});
-  const total = context.sourceCalendars.length;
-  const matches = (value, pattern) => !pattern || new RegExp(pattern).test(value);
-  context.sourceCalendars = context.sourceCalendars.filter(mapping =>
-    matches(mapping.src, src) && matches(mapping.trgt, trgt));
-  log("Source filters: src=%j, trgt=%j; keeping %s of %s mappings", src, trgt,
-    context.sourceCalendars.length, total);
+  const entryFile = fs.existsSync(path.join(projectDir, "Code.gs")) ? ["Code.gs"] : [];
+  for (const name of [...files, ...entryFile])
+    vm.runInContext(fs.readFileSync(path.join(projectDir, name), "utf8"), context,
+      {filename: path.join(projectDir, name)});
+  if (Array.isArray(context.sourceCalendars)) {
+    const total = context.sourceCalendars.length;
+    const matches = (value, pattern) => !pattern || new RegExp(pattern).test(value);
+    context.sourceCalendars = context.sourceCalendars.filter(mapping =>
+      matches(mapping.src, src) && matches(mapping.trgt, trgt));
+    log("Source filters: src=%j, trgt=%j; keeping %s of %s mappings", src, trgt,
+      context.sourceCalendars.length, total);
+  }
   return context;
 }
 
+/**
+ * Runs the selected GAS function with console/file logging.
+ * @returns {void}
+ */
 function main() {
   fs.writeFileSync(logFile, "", "utf8");
   const log = (...args) => {
@@ -389,7 +443,8 @@ function main() {
     const {values, positionals} = util.parseArgs({
       options: {
         src: {type: "string", default: ""},
-        trgt: {type: "string", default: ""}
+        trgt: {type: "string", default: ""},
+        "eml-dir": {type: "string", default: ""}
       },
       allowPositionals: true
     });
@@ -398,7 +453,9 @@ function main() {
     const entryPoint = positionals[0] || "startSync";
     log("GAS local runner: %s; Node %s; %s", entryPoint, process.versions.node, new Date().toISOString());
     log("Live source HTTP; empty calendar reads; Google writes are emulated. Log: %s", logFile);
-    const context = createContext(log, values);
+    const context = createContext(log, {
+      src: values.src, trgt: values.trgt, emlDir: values["eml-dir"]
+    });
     if (!/^[A-Za-z_$][\w$]*$/.test(entryPoint) || typeof context[entryPoint] !== "function")
       throw new Error(`Unknown GAS entry point: ${entryPoint}`);
     context[entryPoint]();

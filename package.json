@@ -1,0 +1,9 @@
+{
+  "name": "gas-nodejs-tester",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Google Apps Script simulator",
+  "dependencies": {
+    "mailparser": "^3.9.3"
+  }
+}
